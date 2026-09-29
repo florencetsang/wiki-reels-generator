@@ -19,7 +19,10 @@ Usage:
   python build_wikipedia_reels.py --workers 1
 
 Notes:
-- `--resume` skips an article when reels/<pageid>.json is already present in R2.
+- `--resume` skips an article when reels/<pageid>.json is already present in R2
+  (or in the local reels/ directory when running with --dry-run).
+- In --dry-run mode, reel objects and generated infographic assets are
+  written locally under reels/, mirroring the R2 key layout.
 - Embeddings are cached locally in .cache/embeddings/.
 - Section count uses top-level article sections only (level "2"), excluding
   See also, References, Further reading, External links, Notes, Bibliography,
@@ -88,6 +91,11 @@ CACHE_DIR = Path(".cache")
 EMBEDDING_CACHE_DIR = CACHE_DIR / "embeddings"
 EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Local copy of reel objects and infographic assets, mirroring the R2 key
+# layout. Always written in dry-run mode so output can be inspected
+# without an R2 bucket.
+LOCAL_REELS_DIR = Path("reels")
+
 # These three root categories collectively represent the requested data set.
 VITAL_ROOT_CATEGORIES = [
     "Category:Wikipedia level-3 vital articles",
@@ -145,6 +153,23 @@ def stable_json(value: Any) -> bytes:
 def chunks(items: list[str], size: int) -> Iterable[list[str]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def local_reel_path(pageid: int) -> Path:
+    return LOCAL_REELS_DIR / f"{pageid}.json"
+
+
+def local_infographic_path(
+    pageid: int,
+    page_number: int,
+    extension: str,
+) -> Path:
+    return (
+        LOCAL_REELS_DIR
+        / str(pageid)
+        / "infographics"
+        / f"{page_number:03d}.{extension}"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -593,7 +618,10 @@ def process_one_article(
     original_pageid = int(discovered["pageid"])
     eventual_reel_key = f"reels/{original_pageid}.json"
 
-    if resume and r2 and r2.object_exists(eventual_reel_key):
+    if resume and (
+        (r2 and r2.object_exists(eventual_reel_key))
+        or local_reel_path(original_pageid).exists()
+    ):
         return {
             "title": title,
             "pageid": original_pageid,
@@ -612,7 +640,10 @@ def process_one_article(
     pageid = metadata["pageid"]
     reel_key = f"reels/{pageid}.json"
 
-    if resume and r2 and r2.object_exists(reel_key):
+    if resume and (
+        (r2 and r2.object_exists(reel_key))
+        or local_reel_path(pageid).exists()
+    ):
         return {
             "title": metadata["title"],
             "pageid": pageid,
@@ -651,6 +682,21 @@ def process_one_article(
                 )
                 continue
 
+            local_image_path = local_infographic_path(
+                pageid, page_number, "png"
+            )
+            if resume and dry_run and local_image_path.exists():
+                infographic_items.append(
+                    {
+                        "page": page_number,
+                        "section": section_title,
+                        "local_path": str(local_image_path),
+                        "mime_type": "image/png",
+                        "status": "reused",
+                    }
+                )
+                continue
+
             image_bytes, mime_type = gemini.generate_page(
                 article_title=metadata["title"],
                 all_sections=sections,
@@ -658,23 +704,34 @@ def process_one_article(
                 section_title=section_title,
             )
 
+            extension = "png" if mime_type == "image/png" else "webp"
+
             if not dry_run and r2:
-                extension = "png" if mime_type == "image/png" else "webp"
                 key = (
                     f"reels/{pageid}/infographics/"
                     f"{page_number:03d}.{extension}"
                 )
                 r2.put_image(key, image_bytes, mime_type)
 
-            infographic_items.append(
-                {
-                    "page": page_number,
-                    "section": section_title,
-                    "r2_key": key,
-                    "mime_type": mime_type,
-                    "status": "generated" if not dry_run else "dry_run",
-                }
-            )
+            if dry_run:
+                # Keep a local copy of the generated asset. Gemini quota is
+                # spent either way, and the file mirrors the R2 key layout.
+                local_image_path = local_infographic_path(
+                    pageid, page_number, extension
+                )
+                local_image_path.parent.mkdir(parents=True, exist_ok=True)
+                local_image_path.write_bytes(image_bytes)
+
+            item = {
+                "page": page_number,
+                "section": section_title,
+                "r2_key": key,
+                "mime_type": mime_type,
+                "status": "generated" if not dry_run else "dry_run",
+            }
+            if dry_run:
+                item["local_path"] = str(local_image_path)
+            infographic_items.append(item)
 
             time.sleep(GEMINI_DELAY_SECONDS)
 
@@ -686,7 +743,13 @@ def process_one_article(
         embedding=embedding,
     )
 
-    if not dry_run and r2:
+    if dry_run:
+        # Write the reel object locally so output can be inspected without
+        # an R2 bucket. Uses the same key layout as R2 (reels/<pageid>.json).
+        local_path = local_reel_path(pageid)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(stable_json(reel))
+    elif r2:
         r2.put_json(reel_key, reel)
 
     return {
@@ -694,6 +757,7 @@ def process_one_article(
         "pageid": pageid,
         "status": "completed" if not dry_run else "dry_run",
         "reel_key": reel_key,
+        "local_reel_path": str(local_reel_path(pageid)) if dry_run else None,
         "section_count": len(sections),
         "infographic_count": len(infographic_items),
     }
@@ -714,7 +778,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Fetch Wikipedia and create embeddings, but do not upload to R2.",
+        help=(
+            "Fetch Wikipedia and create embeddings, but do not upload to "
+            "R2. Reel objects and infographic assets are written locally "
+            "under reels/ instead."
+        ),
     )
     parser.add_argument(
         "--resume",
