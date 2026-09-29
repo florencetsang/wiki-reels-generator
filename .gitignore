@@ -1,0 +1,9 @@
+.env
+.idea/
+.cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+infographics/
+manifest-*.json
