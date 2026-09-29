@@ -469,11 +469,7 @@ legible, and in English. Do not add a watermark or logo.
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
-                response_format={
-                    "image": {
-                        "aspect_ratio": "9:16",
-                    }
-                },
+                image_config=types.ImageConfig(aspect_ratio="9:16"),
             ),
         )
 
