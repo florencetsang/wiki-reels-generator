@@ -58,80 +58,15 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-If you encounter:
-
-```text
-ModuleNotFoundError: No module named 'boto3'
-```
-
-install the project dependencies again, or install the missing package directly:
-
-```bash
-pip install boto3
-```
-
-A suitable `requirements.txt` should include at least:
-
-```text
-boto3
-requests
-python-dotenv
-google-genai
-sentence-transformers
-torch
-```
-
 Depending on your environment, `sentence-transformers` may install PyTorch automatically. If it does not, install the appropriate PyTorch build for your platform before running the script.
 
 ## Configuration
 
-Copy the example environment file:
+Copy the example environment file and set the values in `.env`:
 
 ```bash
 cp .env.example .env
 ```
-
-Set the following values in `.env`:
-
-```dotenv
-# Recommended: identify your application and provide a real contact address.
-WIKIPEDIA_USER_AGENT=WikipediaReelsBot/1.0 (your-email@example.com)
-
-# Google Gemini
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
-
-# Embeddings
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-
-# Cloudflare R2
-R2_BUCKET=your-r2-bucket-name
-R2_ACCOUNT_ID=your-cloudflare-account-id
-R2_ACCESS_KEY_ID=your-r2-access-key-id
-R2_SECRET_ACCESS_KEY=your-r2-secret-access-key
-
-# Optional. If omitted, it is derived from R2_ACCOUNT_ID.
-R2_ENDPOINT_URL=https://your-cloudflare-account-id.r2.cloudflarestorage.com
-```
-
-### Minimal `.env.example`
-
-```dotenv
-WIKIPEDIA_USER_AGENT=WikipediaReelsBot/1.0 (contact@example.com)
-
-GEMINI_API_KEY=
-GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
-
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-
-R2_BUCKET=
-R2_ACCOUNT_ID=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_ENDPOINT_URL=
-```
-
-> Never commit `.env`, API keys, or R2 credentials. Add `.env` to `.gitignore`.
 
 ## Usage
 
@@ -398,25 +333,3 @@ Before redistributing generated content, verify the licensing requirements for:
 - Any source images or media incorporated by upstream services
 - Generated image assets
 - Your downstream product and distribution model
-
-## Security
-
-Do not commit:
-
-```text
-.env
-.cache/
-manifest-*.json
-```
-
-Recommended `.gitignore` entries:
-
-```gitignore
-.env
-.venv/
-__pycache__/
-.cache/
-manifest-*.json
-*.pyc
-```
-```
