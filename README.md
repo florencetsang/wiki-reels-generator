@@ -268,20 +268,6 @@ Delete `.cache/embeddings/` to force regeneration of all embeddings.
 
 ## Troubleshooting
 
-### `ModuleNotFoundError: No module named 'boto3'`
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Or install the missing package:
-
-```bash
-pip install boto3
-```
-
 ### `GEMINI_API_KEY is required.`
 
 Set `GEMINI_API_KEY` in `.env`, then rerun the command.
@@ -310,18 +296,6 @@ https://<account-id>.r2.cloudflarestorage.com
 ```
 
 Also verify that the access key and secret are R2 S3 API credentials, not a general Cloudflare API token.
-
-### No image generation desired
-
-Use:
-
-```bash
-python build_wikipedia_reels.py --no-images
-```
-
-### An article is skipped because it has no summary
-
-The script only creates reels for articles with a non-empty Wikipedia lead extract. Check the source article or supply a different title.
 
 ## Attribution and licensing
 
