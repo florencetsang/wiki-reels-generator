@@ -8,11 +8,15 @@ Per-article pipeline, checkpointed in SQLite so a run can be stopped
   2. summarize - fetch lead summary, categories, page ID and revision
   3. embed     - compute a local sentence-transformers embedding
   4. images    - one infographic per section, using wikiinfo.py logic
+  5. upload    - infographics and reel JSON to Cloudflare R2:
+                   reels/<pageid>.json
+                   reels/<pageid>/infographics/001.webp ...
 
 Usage:
   python build_wikipedia_reels.py                  # level 3, resumes automatically
   python build_wikipedia_reels.py --level 4 --limit 20
   python build_wikipedia_reels.py --no-images      # summaries + embeddings only
+  python build_wikipedia_reels.py --no-upload      # keep infographics local only
   python build_wikipedia_reels.py --status         # print progress and exit
 """
 
@@ -29,7 +33,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import boto3
 import requests
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 from google.genai import errors
 
 from wikiinfo import (
@@ -41,6 +48,8 @@ from wikiinfo import (
 )
 
 
+load_dotenv()
+
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 USER_AGENT = os.getenv(
     "WIKIPEDIA_USER_AGENT",
@@ -51,6 +60,17 @@ EMBEDDING_MODEL_NAME = os.getenv(
     "sentence-transformers/all-MiniLM-L6-v2",
 )
 WIKIPEDIA_DELAY_SECONDS = 0.10
+
+R2_BUCKET = os.getenv("R2_BUCKET", "")
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_ENDPOINT_URL = os.getenv(
+    "R2_ENDPOINT_URL",
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    if R2_ACCOUNT_ID
+    else "",
+)
 
 # Quota exhaustion / access denied affect every article, so stop the run
 # instead of burning per-article retry attempts.
@@ -366,12 +386,104 @@ class Embedder:
 
 
 # -----------------------------------------------------------------------------
+# Cloudflare R2
+# -----------------------------------------------------------------------------
+
+class R2Store:
+    def __init__(self) -> None:
+        required = {
+            "R2_BUCKET": R2_BUCKET,
+            "R2_ENDPOINT_URL": R2_ENDPOINT_URL,
+            "R2_ACCESS_KEY_ID": R2_ACCESS_KEY_ID,
+            "R2_SECRET_ACCESS_KEY": R2_SECRET_ACCESS_KEY,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "Missing R2 configuration: " + ", ".join(missing)
+            )
+
+        self.bucket = R2_BUCKET
+        self.client = boto3.client(
+            service_name="s3",
+            endpoint_url=R2_ENDPOINT_URL,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+
+    def object_exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+
+    def put_json(self, key: str, value: dict[str, Any]) -> None:
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=json.dumps(
+                value, ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+
+    def put_image(self, key: str, content: bytes, mime_type: str) -> None:
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=content,
+            ContentType=mime_type,
+        )
+
+
+def infographic_key(pageid: int, position: int, output_path: Path) -> str:
+    return f"reels/{pageid}/infographics/{position:03d}{output_path.suffix}"
+
+
+def make_reel_object(row: sqlite3.Row, sections: list[sqlite3.Row]) -> dict[str, Any]:
+    embedding = array("f")
+    embedding.frombytes(row["embedding"])
+    return {
+        "pageid": row["pageid"],
+        "title": row["resolved_title"] or row["title"],
+        "canonical_url": row["canonical_url"],
+        "revision_id": row["revision_id"],
+        "vital_level": row["vital_level"],
+        "summary": row["summary"],
+        "categories": json.loads(row["categories"]),
+        "embedding": {
+            "model": row["embedding_model"],
+            "dim": row["embedding_dim"],
+            "vector": list(embedding),
+        },
+        "infographics": [
+            {
+                "page": section["position"],
+                "section": section["section_title"],
+                "r2_key": infographic_key(
+                    row["pageid"], section["position"], Path(section["output_path"])
+                ),
+                "mime_type": "image/webp",
+            }
+            for section in sections
+        ],
+        "updated_at": utc_now_iso(),
+    }
+
+
+# -----------------------------------------------------------------------------
 # Pipeline
 # -----------------------------------------------------------------------------
 
 def generate_article_infographics(
     db: ProgressDB,
     gemini,
+    r2: R2Store | None,
     row: sqlite3.Row,
     output_dir: Path,
     max_sections: int,
@@ -419,6 +531,13 @@ def generate_article_infographics(
             )
             generate_infographic_image(gemini, prompt, output_path)
 
+        if r2:
+            r2.put_image(
+                infographic_key(row["pageid"], section["position"], output_path),
+                output_path.read_bytes(),
+                "image/webp",
+            )
+
         db.mark_section_done(title, section["position"])
 
 
@@ -427,6 +546,7 @@ def process_article(
     wiki: WikipediaClient,
     embedder: Embedder,
     gemini,
+    r2: R2Store | None,
     row: sqlite3.Row,
     args: argparse.Namespace,
 ) -> str:
@@ -459,8 +579,13 @@ def process_article(
         return row["status"]
 
     generate_article_infographics(
-        db, gemini, row, args.output_dir, args.max_sections
+        db, gemini, r2, row, args.output_dir, args.max_sections
     )
+    if r2:
+        r2.put_json(
+            f"reels/{row['pageid']}.json",
+            make_reel_object(row, db.get_sections(title)),
+        )
     db.update_article(title, status="done", error=None)
     return "done"
 
@@ -516,6 +641,11 @@ def parse_args() -> argparse.Namespace:
         help="Only fetch summaries and compute embeddings",
     )
     parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Do not upload infographics and reel JSON to Cloudflare R2",
+    )
+    parser.add_argument(
         "--rediscover",
         action="store_true",
         help="Re-scan Wikipedia categories for newly added articles",
@@ -551,6 +681,12 @@ def main() -> int:
         db.save_discovery(args.level, titles)
         logging.info("Discovered %d level-%d vital articles", len(titles), args.level)
 
+    try:
+        r2 = None if args.no_upload or args.no_images else R2Store()
+    except RuntimeError as exc:
+        logging.error("%s. Use --no-upload to skip R2.", exc)
+        return 2
+
     gemini = None if args.no_images else create_client()
     embedder = Embedder(EMBEDDING_MODEL_NAME)
 
@@ -566,7 +702,7 @@ def main() -> int:
         title = row["title"]
         logging.info("[%d/%d] %s (%s)", index, len(rows), title, row["status"])
         try:
-            result = process_article(db, wiki, embedder, gemini, row, args)
+            result = process_article(db, wiki, embedder, gemini, r2, row, args)
             logging.info("  -> %s", result)
         except errors.ClientError as exc:
             if exc.code in FATAL_GEMINI_CODES:
