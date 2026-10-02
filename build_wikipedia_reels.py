@@ -1,179 +1,369 @@
 #!/usr/bin/env python3
 """
-Build Wikipedia reel objects for Level 3-5 Vital Articles.
+Generate infographics for every Wikipedia Vital Article at a given level.
 
-Stored in Cloudflare R2:
-  reels/<pageid>.json
-  reels/<pageid>/infographics/001.png
-  reels/<pageid>/infographics/002.png
-  ...
-  manifests/<run_id>.json
+Per-article pipeline, checkpointed in SQLite (Cloudflare D1 when configured,
+otherwise a local file) so a run can be stopped (Ctrl+C, crash, quota
+exhaustion) and resumed at any time:
+  1. discover  - list level-X vital articles from Wikipedia categories
+  2. summarize - fetch lead summary, categories, page ID and revision
+  3. embed     - compute a local sentence-transformers embedding
+  4. images    - one infographic per section, using wikiinfo.py logic
+  5. upload    - infographics and reel JSON to Cloudflare R2 when configured:
+                   reels/<pageid>.json
+                   reels/<pageid>/infographics/001.webp ...
+                 otherwise reel JSON is written to <output-dir>/<topic>/reel.json
 
 Usage:
-  pip install -r requirements.txt
-  cp .env.example .env
-  # Fill in .env values
-  python build_wikipedia_reels.py --dry-run --limit 3
-  python build_wikipedia_reels.py --limit 25
-  python build_wikipedia_reels.py --resume
-  python build_wikipedia_reels.py --workers 1
-
-Notes:
-- `--resume` skips an article when reels/<pageid>.json is already present in R2
-  (or in the local reels/ directory when running with --dry-run).
-- In --dry-run mode, reel objects and generated infographic assets are
-  written locally under reels/, mirroring the R2 key layout.
-- Embeddings are cached locally in .cache/embeddings/.
-- Section count uses top-level article sections only (level "2"), excluding
-  See also, References, Further reading, External links, Notes, Bibliography,
-  Sources, and Citations.
-- One Gemini image call is made per retained section.
+  python build_wikipedia_reels.py                  # level 3, resumes automatically
+  python build_wikipedia_reels.py --level 4 --limit 20
+  python build_wikipedia_reels.py --no-images      # summaries + embeddings only
+  python build_wikipedia_reels.py --local          # ignore Cloudflare config
+  python build_wikipedia_reels.py --status         # print progress and exit
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
 import json
 import logging
 import os
-import re
-import sys
+import sqlite3
 import time
-import uuid
+from array import array
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import quote
+from typing import Any
 
 import boto3
 import requests
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-from sentence_transformers import SentenceTransformer
+from google.genai import errors
 
+from wikiinfo import (
+    build_infographic_prompt,
+    create_client,
+    fetch_wikipedia_sections,
+    generate_infographic_image,
+    safe_filename,
+)
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
 
 load_dotenv()
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
-WIKIPEDIA_REST = "https://en.wikipedia.org/api/rest_v1/page/summary"
-
 USER_AGENT = os.getenv(
     "WIKIPEDIA_USER_AGENT",
-    "WikipediaReelsBot/1.0 (contact@example.com)",
+    "WikiToInfographicBot/1.0 (contact@example.com)",
 )
-
-GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL",
     "sentence-transformers/all-MiniLM-L6-v2",
 )
+WIKIPEDIA_DELAY_SECONDS = 0.10
 
-R2_BUCKET = os.getenv("R2_BUCKET", "")
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
-R2_ENDPOINT_URL = os.getenv(
-    "R2_ENDPOINT_URL",
+
+def cloudflare_env(name: str) -> str:
+    # Values copied unchanged from .env.example count as unset.
+    value = os.getenv(name, "").strip()
+    return "" if value == "replace_me" else value
+
+
+R2_BUCKET = cloudflare_env("R2_BUCKET")
+R2_ACCOUNT_ID = cloudflare_env("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = cloudflare_env("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = cloudflare_env("R2_SECRET_ACCESS_KEY")
+R2_ENDPOINT_URL = cloudflare_env("R2_ENDPOINT_URL") or (
     f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     if R2_ACCOUNT_ID
-    else "",
+    else ""
 )
 
-CACHE_DIR = Path(".cache")
-EMBEDDING_CACHE_DIR = CACHE_DIR / "embeddings"
-EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CLOUDFLARE_ACCOUNT_ID = cloudflare_env("CLOUDFLARE_ACCOUNT_ID") or R2_ACCOUNT_ID
+CLOUDFLARE_API_TOKEN = cloudflare_env("CLOUDFLARE_API_TOKEN")
+D1_DATABASE_ID = cloudflare_env("D1_DATABASE_ID")
+# Statements per D1 HTTP request; each request must finish within 30 seconds.
+D1_BATCH_SIZE = 200
 
-# Local copy of reel objects and infographic assets, mirroring the R2 key
-# layout. Always written in dry-run mode so output can be inspected
-# without an R2 bucket.
-LOCAL_REELS_DIR = Path("reels")
+# Quota exhaustion / access denied affect every article, so stop the run
+# instead of burning per-article retry attempts.
+FATAL_GEMINI_CODES = {403, 429}
 
-# These three root categories collectively represent the requested data set.
-VITAL_ROOT_CATEGORIES = [
-    "Category:Wikipedia level-3 vital articles",
-    "Category:Wikipedia level-4 vital articles",
-    "Category:Wikipedia level-5 vital articles",
-]
+ARTICLE_NS = 0
+TALK_NS = 1
+CATEGORY_NS = 14
 
-# Do not generate pages for these conventional reference/navigation sections.
-EXCLUDED_SECTION_TITLES = {
-    "see also",
-    "references",
-    "external links",
-    "further reading",
-    "notes",
-    "bibliography",
-    "sources",
-    "citations",
-}
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS discoveries (
+    level         INTEGER PRIMARY KEY,
+    article_count INTEGER NOT NULL,
+    completed_at  TEXT NOT NULL
+);
 
-# Namespace 0 is normal encyclopedia articles.
-ARTICLE_NAMESPACE = 0
+-- status: pending -> summarized -> embedded -> done | skipped
+CREATE TABLE IF NOT EXISTS articles (
+    title           TEXT PRIMARY KEY,
+    vital_level     INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    pageid          INTEGER,
+    resolved_title  TEXT,
+    canonical_url   TEXT,
+    revision_id     INTEGER,
+    summary         TEXT,
+    categories      TEXT,
+    embedding_model TEXT,
+    embedding_dim   INTEGER,
+    embedding       TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_articles_level_status
+    ON articles (vital_level, status);
 
-# Conservative throttling. Increase only after testing and respecting Wikimedia.
-WIKIPEDIA_DELAY_SECONDS = 0.10
-GEMINI_DELAY_SECONDS = 0.25
+CREATE TABLE IF NOT EXISTS sections (
+    title         TEXT NOT NULL REFERENCES articles (title),
+    position      INTEGER NOT NULL,
+    section_title TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    output_path   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (title, position)
+);
+"""
 
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
+Row = dict[str, Any]
+Statement = tuple[str, tuple[Any, ...]]
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def slugify(value: str) -> str:
-    value = value.strip().replace(" ", "_")
-    value = re.sub(r"[^\w.-]+", "-", value, flags=re.UNICODE)
-    return value[:160].strip("-") or "untitled"
-
-
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def stable_json(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
-def chunks(items: list[str], size: int) -> Iterable[list[str]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
-
-
-def local_reel_path(pageid: int) -> Path:
-    return LOCAL_REELS_DIR / f"{pageid}.json"
-
-
-def local_infographic_path(
-    pageid: int,
-    page_number: int,
-    extension: str,
-) -> Path:
-    return (
-        LOCAL_REELS_DIR
-        / str(pageid)
-        / "infographics"
-        / f"{page_number:03d}.{extension}"
-    )
+def to_json_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
 
 
 # -----------------------------------------------------------------------------
-# Wikipedia client
+# Progress database backends
+# -----------------------------------------------------------------------------
+
+class LocalSQLite:
+    def __init__(self, path: Path) -> None:
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+
+    def script(self, sql: str) -> None:
+        self.conn.executescript(sql)
+
+    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
+        with self.conn:
+            return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def batch(self, statements: list[Statement]) -> None:
+        with self.conn:
+            for sql, params in statements:
+                self.conn.execute(sql, params)
+
+
+class D1Database:
+    """Cloudflare D1 over its HTTP query API."""
+
+    def __init__(self) -> None:
+        required = {
+            "CLOUDFLARE_ACCOUNT_ID": CLOUDFLARE_ACCOUNT_ID,
+            "CLOUDFLARE_API_TOKEN": CLOUDFLARE_API_TOKEN,
+            "D1_DATABASE_ID": D1_DATABASE_ID,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise RuntimeError("Missing D1 configuration: " + ", ".join(missing))
+
+        self.url = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{CLOUDFLARE_ACCOUNT_ID}/d1/database/{D1_DATABASE_ID}/query"
+        )
+        self.session = requests.Session()
+        self.session.headers["Authorization"] = f"Bearer {CLOUDFLARE_API_TOKEN}"
+
+    def _post(self, body: dict[str, Any]) -> list[dict[str, Any]]:
+        response = self.session.post(self.url, json=body, timeout=60)
+        try:
+            data = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise
+        if not data.get("success"):
+            raise RuntimeError(
+                f"D1 query failed (HTTP {response.status_code}): {data.get('errors')}"
+            )
+        return data["result"]
+
+    def script(self, sql: str) -> None:
+        self._post({"sql": sql})
+
+    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[Row]:
+        result = self._post({"sql": sql, "params": list(params)})
+        return result[0].get("results") or []
+
+    def batch(self, statements: list[Statement]) -> None:
+        # D1 runs each batch request as a single transaction.
+        for start in range(0, len(statements), D1_BATCH_SIZE):
+            self._post(
+                {
+                    "batch": [
+                        {"sql": sql, "params": list(params)}
+                        for sql, params in statements[start : start + D1_BATCH_SIZE]
+                    ]
+                }
+            )
+
+
+def open_progress_backend(path: Path, local: bool) -> LocalSQLite | D1Database:
+    if not local and (D1_DATABASE_ID or CLOUDFLARE_API_TOKEN):
+        logging.info("Progress database: Cloudflare D1 %s", D1_DATABASE_ID)
+        return D1Database()
+    logging.info("Progress database: local SQLite %s", path)
+    return LocalSQLite(path)
+
+
+# -----------------------------------------------------------------------------
+# Progress database
+# -----------------------------------------------------------------------------
+
+class ProgressDB:
+    def __init__(self, backend: LocalSQLite | D1Database) -> None:
+        self.db = backend
+        self.db.script(SCHEMA)
+
+    def _one(self, sql: str, params: tuple[Any, ...]) -> Row | None:
+        rows = self.db.query(sql, params)
+        return rows[0] if rows else None
+
+    def is_discovered(self, level: int) -> bool:
+        return self._one(
+            "SELECT 1 FROM discoveries WHERE level = ?", (level,)
+        ) is not None
+
+    def save_discovery(self, level: int, titles: list[str]) -> None:
+        now = utc_now_iso()
+        self.db.batch(
+            [
+                (
+                    "INSERT OR IGNORE INTO articles (title, vital_level, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    (title, level, now),
+                )
+                for title in titles
+            ]
+        )
+        self.db.query(
+            "INSERT OR REPLACE INTO discoveries VALUES (?, ?, ?)",
+            (level, len(titles), now),
+        )
+
+    def get_article(self, title: str) -> Row:
+        return self._one("SELECT * FROM articles WHERE title = ?", (title,))
+
+    def pending_articles(
+        self,
+        level: int,
+        include_images: bool,
+        max_attempts: int,
+        limit: int,
+    ) -> list[Row]:
+        statuses = ["pending", "summarized"]
+        if include_images:
+            statuses.append("embedded")
+        placeholders = ",".join("?" * len(statuses))
+        return self.db.query(
+            f"SELECT * FROM articles WHERE vital_level = ? "
+            f"AND status IN ({placeholders}) AND attempts < ? "
+            f"ORDER BY title COLLATE NOCASE LIMIT {int(limit) if limit > 0 else -1}",
+            (level, *statuses, max_attempts),
+        )
+
+    def update_article(self, title: str, **fields: Any) -> None:
+        fields["updated_at"] = utc_now_iso()
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        self.db.query(
+            f"UPDATE articles SET {assignments} WHERE title = ?",
+            (*fields.values(), title),
+        )
+
+    def record_failure(self, title: str, error: str) -> None:
+        self.db.query(
+            "UPDATE articles SET attempts = attempts + 1, error = ?, "
+            "updated_at = ? WHERE title = ?",
+            (error, utc_now_iso(), title),
+        )
+
+    def get_sections(self, title: str) -> list[Row]:
+        return self.db.query(
+            "SELECT * FROM sections WHERE title = ? ORDER BY position",
+            (title,),
+        )
+
+    def insert_sections(
+        self,
+        title: str,
+        sections: list[tuple[int, str, str, str]],
+    ) -> None:
+        now = utc_now_iso()
+        self.db.batch(
+            [
+                (
+                    "INSERT OR IGNORE INTO sections (title, position, section_title, "
+                    "content, output_path, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (title, *section, now),
+                )
+                for section in sections
+            ]
+        )
+
+    def mark_section_done(self, title: str, position: int) -> None:
+        self.db.query(
+            "UPDATE sections SET status = 'done', updated_at = ? "
+            "WHERE title = ? AND position = ?",
+            (utc_now_iso(), title, position),
+        )
+
+    def print_status(self, level: int) -> None:
+        discovery = self._one(
+            "SELECT * FROM discoveries WHERE level = ?", (level,)
+        )
+        if discovery is None:
+            print(f"Level {level}: not discovered yet.")
+            return
+
+        print(
+            f"Level {level}: {discovery['article_count']} articles "
+            f"(discovered {discovery['completed_at']})"
+        )
+        print("Articles by status:")
+        for row in self.db.query(
+            "SELECT status, COUNT(*) AS n, SUM(error IS NOT NULL) AS with_error "
+            "FROM articles WHERE vital_level = ? GROUP BY status ORDER BY status",
+            (level,),
+        ):
+            print(f"  {row['status']:<11} {row['n']:>6}  (with error: {row['with_error']})")
+
+        print("Infographic sections by status:")
+        for row in self.db.query(
+            "SELECT s.status, COUNT(*) AS n FROM sections s "
+            "JOIN articles a ON a.title = s.title "
+            "WHERE a.vital_level = ? GROUP BY s.status ORDER BY s.status",
+            (level,),
+        ):
+            print(f"  {row['status']:<11} {row['n']:>6}")
+
+
+# -----------------------------------------------------------------------------
+# Wikipedia
 # -----------------------------------------------------------------------------
 
 class WikipediaClient:
@@ -191,101 +381,54 @@ class WikipediaClient:
         time.sleep(WIKIPEDIA_DELAY_SECONDS)
         return response.json()
 
-    def discover_articles_from_category_tree(
-        self,
-        root_categories: list[str],
-    ) -> dict[int, dict[str, Any]]:
+    def discover_vital_titles(self, level: int) -> list[str]:
         """
-        Recursively traverse category members.
+        Vital-article categories are populated by talk-page banners, so members
+        are mostly "Talk:<Article>" pages. Subcategories are followed only when
+        they belong to the same level.
+        """
+        level_marker = f"level-{level} vital"
+        queue = [f"Category:Wikipedia level-{level} vital articles"]
+        seen: set[str] = set()
+        titles: set[str] = set()
 
-        Returns a de-duplicated mapping keyed by page ID:
-          {
-            pageid: {
-              "title": "...",
-              "vital_levels": [3, 4, 5]
+        while queue:
+            category = queue.pop()
+            if category in seen:
+                continue
+            seen.add(category)
+            logging.info("Scanning %s (%d titles so far)", category, len(titles))
+
+            params = {
+                "action": "query",
+                "list": "categorymembers",
+                "cmtitle": category,
+                "cmlimit": "max",
+                "cmprop": "title",
+                "cmnamespace": f"{ARTICLE_NS}|{TALK_NS}|{CATEGORY_NS}",
             }
-          }
+            continuation: dict[str, Any] = {}
 
-        A title may be in more than one Vital level category, so levels are
-        preserved as metadata while page IDs remain unique.
-        """
-        found: dict[int, dict[str, Any]] = {}
-
-        for root in root_categories:
-            level_match = re.search(r"level-(\d+)", root, re.IGNORECASE)
-            level = int(level_match.group(1)) if level_match else None
-
-            logging.info("Discovering category tree: %s", root)
-
-            queue = [root]
-            seen_categories: set[str] = set()
-
-            while queue:
-                category = queue.pop(0)
-
-                if category in seen_categories:
-                    continue
-                seen_categories.add(category)
-
-                cmcontinue: str | None = None
-
-                while True:
-                    result = self.api(
-                        {
-                            "action": "query",
-                            "list": "categorymembers",
-                            "cmtitle": category,
-                            "cmtype": "page|subcat",
-                            "cmlimit": "max",
-                            "cmprop": "ids|title|type",
-                            **({"cmcontinue": cmcontinue} if cmcontinue else {}),
-                        }
-                    )
-
-                    for member in result.get("query", {}).get(
-                        "categorymembers",
-                        [],
-                    ):
-                        member_type = member.get("type")
-                        title = member["title"]
-
-                        if member_type == "subcat":
+            while True:
+                result = self.api({**params, **continuation})
+                for member in result.get("query", {}).get("categorymembers", []):
+                    ns = member.get("ns")
+                    title = member["title"]
+                    if ns == CATEGORY_NS:
+                        if level_marker in title.casefold():
                             queue.append(title)
-                            continue
+                    elif ns == TALK_NS:
+                        titles.add(title.removeprefix("Talk:"))
+                    elif ns == ARTICLE_NS:
+                        titles.add(title)
 
-                        if member.get("ns") != ARTICLE_NAMESPACE:
-                            continue
+                if "continue" not in result:
+                    break
+                continuation = result["continue"]
 
-                        pageid = int(member["pageid"])
-                        entry = found.setdefault(
-                            pageid,
-                            {
-                                "pageid": pageid,
-                                "title": title,
-                                "vital_levels": [],
-                            },
-                        )
-
-                        if level is not None and level not in entry["vital_levels"]:
-                            entry["vital_levels"].append(level)
-
-                    cmcontinue = result.get("continue", {}).get("cmcontinue")
-                    if not cmcontinue:
-                        break
-
-        for item in found.values():
-            item["vital_levels"].sort()
-
-        return found
+        return sorted(titles, key=str.casefold)
 
     def get_article_metadata(self, title: str) -> dict[str, Any] | None:
-        """
-        Fetches title, pageid, lead extract, categories, canonical URL,
-        last revision ID, and timestamp.
-
-        `exintro=1` means the summary is the article lead rather than an
-        LLM-generated summary.
-        """
         result = self.api(
             {
                 "action": "query",
@@ -295,199 +438,61 @@ class WikipediaClient:
                 "exintro": "1",
                 "explaintext": "1",
                 "cllimit": "max",
+                "clshow": "!hidden",
                 "inprop": "url",
-                "rvprop": "ids|timestamp",
-                "rvlimit": "1",
+                "rvprop": "ids",
             }
         )
 
         pages = result.get("query", {}).get("pages", [])
-        if not pages:
+        if not pages or pages[0].get("missing") or pages[0].get("invalid"):
             return None
 
         page = pages[0]
-        if page.get("missing") or page.get("invalid"):
-            return None
-
-        categories = []
-        for category in page.get("categories", []):
-            category_title = category.get("title", "")
-            if category_title.startswith("Category:"):
-                categories.append(category_title.removeprefix("Category:"))
-
-        revisions = page.get("revisions", [])
-        revision = revisions[0] if revisions else {}
+        categories = sorted(
+            {
+                category["title"].removeprefix("Category:")
+                for category in page.get("categories", [])
+            }
+        )
+        revisions = page.get("revisions") or [{}]
 
         return {
             "pageid": int(page["pageid"]),
-            "title": page["title"],
+            "resolved_title": page["title"],
+            "canonical_url": page.get("canonicalurl"),
+            "revision_id": revisions[0].get("revid"),
             "summary": (page.get("extract") or "").strip(),
-            "categories": sorted(set(categories)),
-            "canonical_url": page.get("canonicalurl")
-            or f"https://en.wikipedia.org/wiki/{quote(page['title'].replace(' ', '_'))}",
-            "revision_id": revision.get("revid"),
-            "revision_timestamp": revision.get("timestamp"),
+            "categories": json.dumps(categories, ensure_ascii=False),
         }
-
-    def get_eligible_sections(self, title: str) -> list[str]:
-        """
-        Returns top-level article section names only (MediaWiki level "2").
-        """
-        result = self.api(
-            {
-                "action": "parse",
-                "page": title,
-                "prop": "sections",
-                "redirects": "1",
-            }
-        )
-
-        all_sections = result.get("parse", {}).get("sections", [])
-        retained: list[str] = []
-
-        for section in all_sections:
-            # Level 2 corresponds to standard major headings in article prose.
-            if str(section.get("level")) != "2":
-                continue
-
-            line = re.sub(r"\s+", " ", section.get("line", "")).strip()
-            normalized = line.casefold()
-
-            if not line or normalized in EXCLUDED_SECTION_TITLES:
-                continue
-
-            retained.append(line)
-
-        return retained
 
 
 # -----------------------------------------------------------------------------
 # Embeddings
 # -----------------------------------------------------------------------------
 
-class LocalEmbeddingService:
+class Embedder:
     def __init__(self, model_name: str) -> None:
-        logging.info("Loading embedding model: %s", model_name)
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        self._model = None
 
-    def embed_once(self, summary: str, categories: list[str]) -> list[float]:
-        """
-        Caches the embedding by model name and source-content hash.
+    def embed(self, summary: str, categories: list[str]) -> list[float]:
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
 
-        Embeddings are normalized; cosine similarity can be calculated using
-        a dot product if your future vector store supports it.
-        """
-        embedding_source = (
-            f"Summary:\n{summary}\n\n"
-            f"Wikipedia categories:\n"
+            logging.info("Loading embedding model: %s", self.model_name)
+            self._model = SentenceTransformer(self.model_name)
+
+        source = (
+            f"Summary:\n{summary}\n\nWikipedia categories:\n"
             + "\n".join(f"- {category}" for category in categories)
         )
-
-        cache_key = sha256_text(
-            f"model={self.model_name}\ncontent={embedding_source}"
-        )
-        cache_path = EMBEDDING_CACHE_DIR / f"{cache_key}.json"
-
-        if cache_path.exists():
-            return json.loads(cache_path.read_text(encoding="utf-8"))
-
-        vector = self.model.encode(
-            embedding_source,
+        vector = self._model.encode(
+            source,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-
-        result = [float(item) for item in vector.tolist()]
-        cache_path.write_text(
-            json.dumps(result, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        return result
-
-
-# -----------------------------------------------------------------------------
-# Gemini / Nano Banana image generation
-# -----------------------------------------------------------------------------
-
-class GeminiInfographicService:
-    def __init__(self) -> None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is required.")
-
-        self.client = genai.Client(api_key=api_key)
-
-    @staticmethod
-    def infographic_prompt(
-        article_title: str,
-        all_sections: list[str],
-        page_number: int,
-        section_title: str,
-    ) -> str:
-        """
-        Keeps the user's requested prompt language, while adding explicit
-        instructions that ensure a single returned asset is page i of n.
-        """
-        n = len(all_sections)
-        article_url = (
-            "https://en.wikipedia.org/wiki/"
-            + quote(article_title.replace(" ", "_"))
-        )
-        sections_text = ", ".join(all_sections)
-
-        return f"""
-Generate {n} infographics about the {sections_text} of {article_title}: {article_url}
-
-Generate infographic page {page_number} of {n}. This page must focus primarily
-on the section "{section_title}".
-
-Create a polished, editorial, fact-oriented vertical infographic suitable for a
-short-form video reel. Use a 9:16 composition. Include a clear title,
-well-structured visual hierarchy, icons, diagrams, timelines, maps, or charts
-when useful. Avoid fabricating precise statistics, dates, quotations, citations,
-or claims not safely supported by the cited Wikipedia article. Keep text concise,
-legible, and in English. Do not add a watermark or logo.
-""".strip()
-
-    def generate_page(
-        self,
-        article_title: str,
-        all_sections: list[str],
-        page_number: int,
-        section_title: str,
-    ) -> tuple[bytes, str]:
-        prompt = self.infographic_prompt(
-            article_title=article_title,
-            all_sections=all_sections,
-            page_number=page_number,
-            section_title=section_title,
-        )
-
-        response = self.client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="9:16"),
-            ),
-        )
-
-        for part in response.parts or []:
-            if part.inline_data and part.inline_data.data:
-                data = part.inline_data.data
-                mime_type = part.inline_data.mime_type or "image/png"
-
-                # SDK versions can expose bytes or a base64 string.
-                if isinstance(data, str):
-                    data = base64.b64decode(data)
-
-                return data, mime_type
-
-        raise RuntimeError(
-            f"Gemini returned no image for {article_title!r}, "
-            f"section {section_title!r}."
-        )
+        return [float(value) for value in vector]
 
 
 # -----------------------------------------------------------------------------
@@ -531,7 +536,7 @@ class R2Store:
         self.client.put_object(
             Bucket=self.bucket,
             Key=key,
-            Body=stable_json(value),
+            Body=to_json_bytes(value),
             ContentType="application/json; charset=utf-8",
         )
 
@@ -544,219 +549,164 @@ class R2Store:
         )
 
 
-# -----------------------------------------------------------------------------
-# Reel assembly
-# -----------------------------------------------------------------------------
+def infographic_key(pageid: int, position: int, output_path: Path) -> str:
+    return f"reels/{pageid}/infographics/{position:03d}{output_path.suffix}"
 
-def make_reel_object(
-    metadata: dict[str, Any],
-    vital_levels: list[int],
-    eligible_sections: list[str],
-    infographic_items: list[dict[str, Any]],
-    embedding: list[float],
-) -> dict[str, Any]:
-    """
-    The storage object intentionally retains source URL/revision metadata.
-    This is useful for attribution, refresh jobs, auditability, and detecting
-    articles whose Wikipedia source has changed.
-    """
+
+def decode_embedding(value: str | bytes) -> list[float]:
+    if isinstance(value, bytes):
+        # Local databases created before embeddings were stored as JSON.
+        vector = array("f")
+        vector.frombytes(value)
+        return list(vector)
+    return json.loads(value)
+
+
+def make_reel_object(row: Row, sections: list[Row]) -> dict[str, Any]:
     return {
-        "schema_version": "1.0",
-        "type": "wikipedia_reel",
-        "id": f"wikipedia:{metadata['pageid']}",
-        "title": metadata["title"],
-        "summary": metadata["summary"],
-        "category_tags": metadata["categories"],
+        "pageid": row["pageid"],
+        "title": row["resolved_title"] or row["title"],
+        "canonical_url": row["canonical_url"],
+        "revision_id": row["revision_id"],
+        "vital_level": row["vital_level"],
+        "summary": row["summary"],
+        "categories": json.loads(row["categories"]),
         "embedding": {
-            "model": EMBEDDING_MODEL_NAME,
-            "dimensions": len(embedding),
-            "normalized": True,
-            "vector": embedding,
+            "model": row["embedding_model"],
+            "dim": row["embedding_dim"],
+            "vector": decode_embedding(row["embedding"]),
         },
-        "infographics": {
-            "page_count": len(eligible_sections),
-            "sections": eligible_sections,
-            "assets": infographic_items,
-            "generator": {
-                "provider": "Google Gemini",
-                "model": GEMINI_MODEL,
-                "aspect_ratio": "9:16",
-            },
-        },
-        "source": {
-            "project": "English Wikipedia",
-            "article_url": metadata["canonical_url"],
-            "pageid": metadata["pageid"],
-            "revision_id": metadata["revision_id"],
-            "revision_timestamp": metadata["revision_timestamp"],
-            "vital_article_levels": vital_levels,
-            "license_note": (
-                "Wikipedia text is generally available under "
-                "CC BY-SA 4.0; preserve attribution and verify applicable "
-                "source licensing before redistribution."
-            ),
-        },
-        "generated_at": utc_now_iso(),
-    }
-
-
-def process_one_article(
-    wiki: WikipediaClient,
-    embeddings: LocalEmbeddingService,
-    gemini: GeminiInfographicService | None,
-    r2: R2Store | None,
-    discovered: dict[str, Any],
-    dry_run: bool,
-    resume: bool,
-    generate_images: bool,
-) -> dict[str, Any]:
-    title = discovered["title"]
-    original_pageid = int(discovered["pageid"])
-    eventual_reel_key = f"reels/{original_pageid}.json"
-
-    if resume and (
-        (r2 and r2.object_exists(eventual_reel_key))
-        or local_reel_path(original_pageid).exists()
-    ):
-        return {
-            "title": title,
-            "pageid": original_pageid,
-            "status": "skipped_existing",
-        }
-
-    metadata = wiki.get_article_metadata(title)
-    if metadata is None:
-        return {
-            "title": title,
-            "pageid": original_pageid,
-            "status": "skipped_missing",
-        }
-
-    # Redirects can resolve to a new page ID.
-    pageid = metadata["pageid"]
-    reel_key = f"reels/{pageid}.json"
-
-    if resume and (
-        (r2 and r2.object_exists(reel_key))
-        or local_reel_path(pageid).exists()
-    ):
-        return {
-            "title": metadata["title"],
-            "pageid": pageid,
-            "status": "skipped_existing",
-        }
-
-    summary = metadata["summary"]
-    if not summary:
-        return {
-            "title": metadata["title"],
-            "pageid": pageid,
-            "status": "skipped_no_summary",
-        }
-
-    sections = wiki.get_eligible_sections(metadata["title"])
-    embedding = embeddings.embed_once(summary, metadata["categories"])
-
-    infographic_items: list[dict[str, Any]] = []
-
-    if generate_images:
-        if gemini is None:
-            raise RuntimeError("Gemini service is required for image generation.")
-
-        for page_number, section_title in enumerate(sections, start=1):
-            key = f"reels/{pageid}/infographics/{page_number:03d}.png"
-
-            if resume and r2 and r2.object_exists(key):
-                infographic_items.append(
-                    {
-                        "page": page_number,
-                        "section": section_title,
-                        "r2_key": key,
-                        "mime_type": "image/png",
-                        "status": "reused",
-                    }
-                )
-                continue
-
-            local_image_path = local_infographic_path(
-                pageid, page_number, "png"
-            )
-            if resume and dry_run and local_image_path.exists():
-                infographic_items.append(
-                    {
-                        "page": page_number,
-                        "section": section_title,
-                        "local_path": str(local_image_path),
-                        "mime_type": "image/png",
-                        "status": "reused",
-                    }
-                )
-                continue
-
-            image_bytes, mime_type = gemini.generate_page(
-                article_title=metadata["title"],
-                all_sections=sections,
-                page_number=page_number,
-                section_title=section_title,
-            )
-
-            extension = "png" if mime_type == "image/png" else "webp"
-
-            if not dry_run and r2:
-                key = (
-                    f"reels/{pageid}/infographics/"
-                    f"{page_number:03d}.{extension}"
-                )
-                r2.put_image(key, image_bytes, mime_type)
-
-            if dry_run:
-                # Keep a local copy of the generated asset. Gemini quota is
-                # spent either way, and the file mirrors the R2 key layout.
-                local_image_path = local_infographic_path(
-                    pageid, page_number, extension
-                )
-                local_image_path.parent.mkdir(parents=True, exist_ok=True)
-                local_image_path.write_bytes(image_bytes)
-
-            item = {
-                "page": page_number,
-                "section": section_title,
-                "r2_key": key,
-                "mime_type": mime_type,
-                "status": "generated" if not dry_run else "dry_run",
+        "infographics": [
+            {
+                "page": section["position"],
+                "section": section["section_title"],
+                "r2_key": infographic_key(
+                    row["pageid"], section["position"], Path(section["output_path"])
+                ),
+                "mime_type": "image/webp",
             }
-            if dry_run:
-                item["local_path"] = str(local_image_path)
-            infographic_items.append(item)
-
-            time.sleep(GEMINI_DELAY_SECONDS)
-
-    reel = make_reel_object(
-        metadata=metadata,
-        vital_levels=discovered["vital_levels"],
-        eligible_sections=sections,
-        infographic_items=infographic_items,
-        embedding=embedding,
-    )
-
-    if dry_run:
-        # Write the reel object locally so output can be inspected without
-        # an R2 bucket. Uses the same key layout as R2 (reels/<pageid>.json).
-        local_path = local_reel_path(pageid)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(stable_json(reel))
-    elif r2:
-        r2.put_json(reel_key, reel)
-
-    return {
-        "title": metadata["title"],
-        "pageid": pageid,
-        "status": "completed" if not dry_run else "dry_run",
-        "reel_key": reel_key,
-        "local_reel_path": str(local_reel_path(pageid)) if dry_run else None,
-        "section_count": len(sections),
-        "infographic_count": len(infographic_items),
+            for section in sections
+        ],
+        "updated_at": utc_now_iso(),
     }
+
+
+# -----------------------------------------------------------------------------
+# Pipeline
+# -----------------------------------------------------------------------------
+
+def generate_article_infographics(
+    db: ProgressDB,
+    gemini,
+    r2: R2Store | None,
+    row: Row,
+    output_dir: Path,
+    max_sections: int,
+) -> None:
+    title = row["title"]
+    article_title = row["resolved_title"] or title
+
+    sections = db.get_sections(title)
+    if not sections:
+        fetched = fetch_wikipedia_sections(article_title)
+        if max_sections > 0:
+            fetched = fetched[:max_sections]
+        topic_dir = output_dir / safe_filename(article_title)
+        db.insert_sections(
+            title,
+            [
+                (
+                    position,
+                    section_title,
+                    content,
+                    str(topic_dir / f"{position:02d}-{safe_filename(section_title)}.webp"),
+                )
+                for position, (section_title, content) in enumerate(fetched, start=1)
+            ],
+        )
+        sections = db.get_sections(title)
+
+    for section in sections:
+        if section["status"] == "done":
+            continue
+
+        output_path = Path(section["output_path"])
+        # The image may have been saved right before an interruption.
+        if not output_path.exists():
+            logging.info(
+                "  [%d/%d] Generating: %s",
+                section["position"],
+                len(sections),
+                section["section_title"],
+            )
+            prompt = build_infographic_prompt(
+                article_title,
+                section["section_title"],
+                section["content"],
+            )
+            generate_infographic_image(gemini, prompt, output_path)
+
+        if r2:
+            r2.put_image(
+                infographic_key(row["pageid"], section["position"], output_path),
+                output_path.read_bytes(),
+                "image/webp",
+            )
+
+        db.mark_section_done(title, section["position"])
+
+
+def process_article(
+    db: ProgressDB,
+    wiki: WikipediaClient,
+    embedder: Embedder,
+    gemini,
+    r2: R2Store | None,
+    row: Row,
+    args: argparse.Namespace,
+) -> str:
+    title = row["title"]
+
+    if row["status"] == "pending":
+        metadata = wiki.get_article_metadata(title)
+        if metadata is None:
+            db.update_article(title, status="skipped", error="article missing")
+            return "skipped"
+        if not metadata["summary"]:
+            db.update_article(title, status="skipped", error="no summary", **metadata)
+            return "skipped"
+        db.update_article(title, status="summarized", **metadata)
+        row = db.get_article(title)
+
+    if row["status"] == "summarized":
+        vector = embedder.embed(row["summary"], json.loads(row["categories"]))
+        db.update_article(
+            title,
+            status="embedded",
+            embedding_model=embedder.model_name,
+            embedding_dim=len(vector),
+            # JSON text because the D1 HTTP API cannot bind BLOB parameters.
+            embedding=json.dumps(vector),
+        )
+        row = db.get_article(title)
+
+    if args.no_images:
+        return row["status"]
+
+    generate_article_infographics(
+        db, gemini, r2, row, args.output_dir, args.max_sections
+    )
+    reel = make_reel_object(row, db.get_sections(title))
+    if r2:
+        r2.put_json(f"reels/{row['pageid']}.json", reel)
+    else:
+        reel_path = (
+            args.output_dir / safe_filename(row["resolved_title"] or title) / "reel.json"
+        )
+        reel_path.parent.mkdir(parents=True, exist_ok=True)
+        reel_path.write_bytes(to_json_bytes(reel))
+    db.update_article(title, status="done", error=None)
+    return "done"
 
 
 # -----------------------------------------------------------------------------
@@ -764,39 +714,66 @@ def process_one_article(
 # -----------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Resumable infographic generation for Wikipedia Vital Articles."
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4, 5],
+        help="Vital article level (default: 3)",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=Path("vital_progress.sqlite3"),
+        help="Local SQLite progress database, used when D1 is not configured "
+        "(default: vital_progress.sqlite3)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("infographics"),
+        help="Parent directory for topic folders (default: infographics)",
+    )
+    parser.add_argument(
+        "--max-sections",
+        type=int,
+        default=10,
+        help="Infographics per article, 0 = all sections (default: 10)",
+    )
     parser.add_argument(
         "--limit",
         type=int,
         default=0,
-        help="Maximum number of unique articles to process. 0 = all.",
+        help="Maximum articles to process in this run, 0 = all",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Fetch Wikipedia and create embeddings, but do not upload to "
-            "R2. Reel objects and infographic assets are written locally "
-            "under reels/ instead."
-        ),
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip reels/assets that already exist in R2.",
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="Skip articles that have failed this many times (default: 3)",
     )
     parser.add_argument(
         "--no-images",
         action="store_true",
-        help="Create reel metadata and embeddings without Gemini calls.",
+        help="Only fetch summaries and compute embeddings",
     )
     parser.add_argument(
-        "--titles-file",
-        type=Path,
-        help=(
-            "Optional newline-delimited article titles. When specified, "
-            "bypasses Vital Article category discovery."
-        ),
+        "--local",
+        action="store_true",
+        help="Ignore Cloudflare config: use local SQLite and skip R2 upload",
+    )
+    parser.add_argument(
+        "--rediscover",
+        action="store_true",
+        help="Re-scan Wikipedia categories for newly added articles",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print progress for --level and exit",
     )
     parser.add_argument(
         "--log-level",
@@ -806,137 +783,79 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_titles_file(path: Path) -> dict[int, dict[str, Any]]:
-    """
-    Assigns temporary IDs for titles-file mode. Actual Wikipedia page IDs are
-    resolved before the reel is stored.
-    """
-    records: dict[int, dict[str, Any]] = {}
-
-    for index, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        title = raw.strip()
-        if not title or title.startswith("#"):
-            continue
-
-        records[-index] = {
-            "pageid": -index,
-            "title": title,
-            "vital_levels": [],
-        }
-
-    return records
-
-
 def main() -> int:
     args = parse_args()
-
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if not args.dry_run and not R2_BUCKET:
-        logging.error("R2 configuration is required unless --dry-run is used.")
+    try:
+        db = ProgressDB(open_progress_backend(args.db, args.local))
+        r2 = (
+            R2Store()
+            if not args.local
+            and not args.no_images
+            and (R2_ACCESS_KEY_ID or R2_SECRET_ACCESS_KEY)
+            else None
+        )
+    except RuntimeError as exc:
+        logging.error("%s. Use --local to run without Cloudflare.", exc)
         return 2
 
+    if args.status:
+        db.print_status(args.level)
+        return 0
+
+    if r2:
+        logging.info("Infographic upload: R2 bucket %s", R2_BUCKET)
+    elif not args.no_images:
+        logging.info("Infographic upload: disabled, output stays in %s", args.output_dir)
+        if isinstance(db.db, D1Database):
+            logging.warning(
+                "D1 is configured but R2 is not; articles will be marked done "
+                "in D1 without uploaded infographics."
+            )
+
     wiki = WikipediaClient()
-    embeddings = LocalEmbeddingService(EMBEDDING_MODEL_NAME)
-    r2 = None if args.dry_run else R2Store()
+    if args.rediscover or not db.is_discovered(args.level):
+        titles = wiki.discover_vital_titles(args.level)
+        db.save_discovery(args.level, titles)
+        logging.info("Discovered %d level-%d vital articles", len(titles), args.level)
 
-    generate_images = not args.no_images
-    gemini = GeminiInfographicService() if generate_images else None
+    gemini = None if args.no_images else create_client()
+    embedder = Embedder(EMBEDDING_MODEL_NAME)
 
-    if args.titles_file:
-        discovered = load_titles_file(args.titles_file)
-    else:
-        discovered = wiki.discover_articles_from_category_tree(
-            VITAL_ROOT_CATEGORIES
-        )
-
-    articles = sorted(
-        discovered.values(),
-        key=lambda item: item["title"].casefold(),
+    rows = db.pending_articles(
+        args.level,
+        include_images=not args.no_images,
+        max_attempts=args.max_attempts,
+        limit=args.limit,
     )
+    logging.info("Articles to process this run: %d", len(rows))
 
-    if args.limit > 0:
-        articles = articles[: args.limit]
-
-    logging.info("Unique articles selected: %d", len(articles))
-    logging.info("Image generation enabled: %s", generate_images)
-    logging.info("Dry run: %s", args.dry_run)
-
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    results: list[dict[str, Any]] = []
-
-    for index, item in enumerate(articles, start=1):
-        logging.info(
-            "[%d/%d] Processing %s",
-            index,
-            len(articles),
-            item["title"],
-        )
-
+    for index, row in enumerate(rows, start=1):
+        title = row["title"]
+        logging.info("[%d/%d] %s (%s)", index, len(rows), title, row["status"])
         try:
-            result = process_one_article(
-                wiki=wiki,
-                embeddings=embeddings,
-                gemini=gemini,
-                r2=r2,
-                discovered=item,
-                dry_run=args.dry_run,
-                resume=args.resume,
-                generate_images=generate_images,
-            )
-            results.append(result)
-            logging.info("Result: %s", result["status"])
-
+            result = process_article(db, wiki, embedder, gemini, r2, row, args)
+            logging.info("  -> %s", result)
+        except errors.ClientError as exc:
+            if exc.code in FATAL_GEMINI_CODES:
+                db.update_article(title, error=f"ClientError: {exc}")
+                logging.error(
+                    "Gemini returned HTTP %s; stopping. Re-run later to resume.",
+                    exc.code,
+                )
+                db.print_status(args.level)
+                return 1
+            logging.exception("Failed: %s", title)
+            db.record_failure(title, f"ClientError: {exc}")
         except Exception as exc:
-            logging.exception("Failed: %s", item["title"])
-            results.append(
-                {
-                    "title": item["title"],
-                    "pageid": item["pageid"],
-                    "status": "failed",
-                    "error": str(exc),
-                }
-            )
+            logging.exception("Failed: %s", title)
+            db.record_failure(title, f"{type(exc).__name__}: {exc}")
 
-    manifest = {
-        "run_id": run_id,
-        "created_at": utc_now_iso(),
-        "settings": {
-            "gemini_model": GEMINI_MODEL,
-            "embedding_model": EMBEDDING_MODEL_NAME,
-            "generate_images": generate_images,
-            "dry_run": args.dry_run,
-            "resume": args.resume,
-        },
-        "summary": {
-            "selected": len(articles),
-            "completed": sum(
-                result["status"] in {"completed", "dry_run"}
-                for result in results
-            ),
-            "failed": sum(
-                result["status"] == "failed"
-                for result in results
-            ),
-            "skipped": sum(
-                result["status"].startswith("skipped")
-                for result in results
-            ),
-        },
-        "results": results,
-    }
-
-    local_manifest = Path(f"manifest-{run_id}.json")
-    local_manifest.write_bytes(stable_json(manifest))
-
-    if not args.dry_run and r2:
-        r2.put_json(f"manifests/{run_id}.json", manifest)
-
-    logging.info("Manifest written locally: %s", local_manifest)
-    logging.info("Run summary: %s", manifest["summary"])
+    db.print_status(args.level)
     return 0
 
 

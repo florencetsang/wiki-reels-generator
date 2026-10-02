@@ -5,3 +5,4 @@ requests>=2.31
 sentence-transformers>=3.0.0
 torch>=2.2.0
 python-dotenv>=1.0.1
+wikiinfo @ git+https://github.com/frederick623/wikiinfo.git
