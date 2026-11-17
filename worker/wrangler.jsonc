@@ -1,0 +1,19 @@
+{
+	"name": "wiki-reels-api",
+	"main": "src/index.js",
+	"compatibility_date": "2026-10-01",
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			// Must match VECTORIZE_INDEX in the pipeline's .env.
+			"index_name": "wiki-reels"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "REELS",
+			// Must match R2_BUCKET in the pipeline's .env.
+			"bucket_name": "wikiinfo"
+		}
+	]
+}

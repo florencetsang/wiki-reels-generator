@@ -8,3 +8,5 @@ venv/
 infographics/
 reels/
 manifest-*.json
+node_modules/
+.wrangler/
