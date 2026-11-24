@@ -29,6 +29,8 @@ def make_reel_object(row: Row, sections: list[Row]) -> dict[str, Any]:
         "canonical_url": row["canonical_url"],
         "revision_id": row["revision_id"],
         "vital_level": row["vital_level"],
+        "vital_field": row["vital_field"],
+        "vital_subfield": row["vital_subfield"],
         "summary": row["summary"],
         "categories": json.loads(row["categories"]),
         "embedding": {

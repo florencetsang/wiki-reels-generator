@@ -121,6 +121,7 @@ def sync_vectors(db: ProgressDB, index: VectorizeIndex | LocalVectorIndex) -> in
             metadata = {
                 "title": row["resolved_title"] or row["title"],
                 "vital_level": row["vital_level"],
+                "vital_field": row["vital_field"],
                 "url": row["canonical_url"],
                 "reel_key": row["r2_reel_key"],
             }

@@ -107,7 +107,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rediscover",
         action="store_true",
-        help="Re-scan Wikipedia categories for newly added articles",
+        help="Re-scan Wikipedia categories for newly added articles and "
+        "to refresh vital_field / vital_subfield labels",
     )
     parser.add_argument(
         "--status",

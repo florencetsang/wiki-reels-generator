@@ -17,8 +17,8 @@ Objects are written to Cloudflare R2 in this structure:
 
 ```text
 reels/<pageid>.json
-reels/<pageid>/infographics/001.png
-reels/<pageid>/infographics/002.png
+reels/<pageid>/infographics/001.webp
+reels/<pageid>/infographics/002.webp
 ...
 manifests/<run_id>.json
 ```
@@ -80,8 +80,8 @@ This still fetches Wikipedia content, generates embeddings, and—unless `--no-i
 
 ```text
 reels/<pageid>.json
-reels/<pageid>/infographics/001.png
-reels/<pageid>/infographics/002.png
+reels/<pageid>/infographics/001.webp
+reels/<pageid>/infographics/002.webp
 ...
 ```
 
@@ -181,47 +181,50 @@ Each reel is stored as `reels/<pageid>.json` and resembles:
 
 ```json
 {
-  "schema_version": "1.0",
-  "type": "wikipedia_reel",
-  "id": "wikipedia:12345",
+  "pageid": 12345,
   "title": "Example article",
+  "canonical_url": "https://en.wikipedia.org/wiki/Example_article",
+  "revision_id": 123456789,
+  "vital_level": 4,
+  "vital_field": "physical_sciences",
+  "vital_subfield": "Astronomy",
   "summary": "The article lead text.",
-  "category_tags": ["Example categories"],
+  "categories": ["Example categories"],
   "embedding": {
     "model": "sentence-transformers/all-MiniLM-L6-v2",
-    "dimensions": 384,
-    "normalized": true,
+    "dim": 384,
     "vector": []
   },
-  "infographics": {
-    "page_count": 2,
-    "sections": ["History", "Legacy"],
-    "assets": [
-      {
-        "page": 1,
-        "section": "History",
-        "r2_key": "reels/12345/infographics/001.png",
-        "mime_type": "image/png",
-        "status": "generated"
-      }
-    ],
-    "generator": {
-      "provider": "Google Gemini",
-      "model": "gemini-2.5-flash-image",
-      "aspect_ratio": "9:16"
+  "infographics": [
+    {
+      "page": 1,
+      "section": "History",
+      "r2_bucket": "wikiinfo",
+      "r2_key": "reels/12345/infographics/001.webp",
+      "mime_type": "image/webp"
     }
-  },
-  "source": {
-    "project": "English Wikipedia",
-    "article_url": "https://en.wikipedia.org/wiki/Example_article",
-    "pageid": 12345,
-    "revision_id": 123456789,
-    "revision_timestamp": "2026-01-01T00:00:00Z",
-    "vital_article_levels": [3],
-    "license_note": "..."
-  },
-  "generated_at": "2026-01-01T00:00:00+00:00"
+  ],
+  "updated_at": "2026-01-01T00:00:00+00:00"
 }
+```
+
+### Vital Articles fields
+
+`vital_field` is the top-level Vital Articles field of the category the article
+was discovered in (`Category:Wikipedia level-N vital articles in <Field>`),
+stored as a stable slug: `people`, `history`, `geography`, `arts`,
+`philosophy_religion`, `everyday_life`, `society`, `biology_health`,
+`physical_sciences`, `technology`, `mathematics`. `vital_subfield` is the name of
+a deeper `... vital articles in <Name>` category when there is one. Both are
+`null` when the article is only in the root category.
+
+Progress databases created before these columns existed are migrated
+automatically; run once with `--rediscover` to backfill the labels. The field is
+also written to Vectorize metadata as `vital_field`; to filter on it, create a
+metadata index before upserting:
+
+```bash
+npx wrangler vectorize create-metadata-index wiki-reels --property-name=vital_field --type=string
 ```
 
 ## Section selection
