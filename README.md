@@ -172,6 +172,7 @@ ERROR
 | `--dry-run` | Fetch Wikipedia content and create embeddings, but do not upload objects to R2. Gemini calls still occur unless `--no-images` is used. |
 | `--resume` | Skip reel JSON and infographic assets that are already present in R2. |
 | `--no-images` | Skip Gemini image generation and create only metadata plus embeddings. |
+| `--backfill-labels` | Add `vital_field` / `vital_subfield` to finished reels' JSON and vector metadata without calling Gemini or re-embedding, then exit. |
 | `--titles-file PATH` | Read article titles from a newline-delimited file instead of discovering Vital Articles. |
 | `--log-level LEVEL` | Set logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
@@ -218,14 +219,34 @@ stored as a stable slug: `people`, `history`, `geography`, `arts`,
 a deeper `... vital articles in <Name>` category when there is one. Both are
 `null` when the article is only in the root category.
 
-Progress databases created before these columns existed are migrated
-automatically; run once with `--rediscover` to backfill the labels. The field is
-also written to Vectorize metadata as `vital_field`; to filter on it, create a
-metadata index before upserting:
+The field is also written to Vectorize metadata as `vital_field`. To filter on
+it, create a metadata index before upserting:
 
 ```bash
 npx wrangler vectorize create-metadata-index wiki-reels --property-name=vital_field --type=string
 ```
+
+#### Labelling reels that are already generated
+
+Progress databases created before these columns existed are migrated
+automatically. To add the labels to finished reels without repeating any paid
+work, run:
+
+```bash
+python infographics.py --level 4 --backfill-labels   # add --local for a local progress DB
+```
+
+This mode:
+
+- only reads Wikipedia category listings;
+- rebuilds each finished reel's JSON from the progress database and overwrites
+  `reels/<pageid>.json` in R2, leaving the infographics untouched;
+- re-upserts the stored embeddings to Vectorize with the new metadata;
+- makes no Gemini calls and does no re-embedding;
+- does not add or process newly listed articles, then exits.
+
+Plain `--rediscover` also refreshes the labels in the database, but it then
+processes any newly discovered articles, which does call Gemini.
 
 ## Section selection
 

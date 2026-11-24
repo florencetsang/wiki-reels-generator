@@ -19,7 +19,7 @@ from .config import (
     VECTORIZE_INDEX,
 )
 from .embeddings import Embedder
-from .pipeline import process_article
+from .pipeline import backfill_labels, process_article
 from .progress import D1Database, ProgressDB, open_progress_backend
 from .storage import R2Store
 from .vectors import LocalVectorIndex, VectorizeIndex, sync_vectors
@@ -111,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         "to refresh vital_field / vital_subfield labels",
     )
     parser.add_argument(
+        "--backfill-labels",
+        action="store_true",
+        help="Add vital_field / vital_subfield to finished reels (reel JSON and "
+        "vector metadata) without calling Gemini or re-embedding, then exit",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Print progress for --level and exit",
@@ -164,6 +170,15 @@ def main() -> int:
             logging.error("%s. Finished reels are added at the end of each run.", exc)
             return 1
         print(json.dumps(matches, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.backfill_labels:
+        if r2 is None and not args.local:
+            logging.error("--backfill-labels needs R2 credentials to rewrite reel JSON.")
+            return 2
+        count = backfill_labels(db, WikipediaClient(), r2, args.level, args.output_dir)
+        logging.info("Reel JSON rewritten with labels: %d", count)
+        logging.info("Vectors re-upserted with labels: %d", sync_vectors(db, vectorize))
         return 0
 
     if r2:

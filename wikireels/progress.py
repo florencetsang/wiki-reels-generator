@@ -209,6 +209,22 @@ class ProgressDB:
             (level, len(titles), now),
         )
 
+    def save_labels(self, titles: dict[str, VitalTopic]) -> None:
+        """Set field labels on already-known articles without adding new ones."""
+        now = utc_now_iso()
+        self.db.batch(
+            [
+                (
+                    "UPDATE articles SET "
+                    "vital_field = COALESCE(?, vital_field), "
+                    "vital_subfield = COALESCE(?, vital_subfield), updated_at = ? "
+                    "WHERE title = ?",
+                    (topic.field, topic.subfield, now, title),
+                )
+                for title, topic in titles.items()
+            ]
+        )
+
     # --- articles ---
 
     def get_article(self, title: str) -> Row:
@@ -298,6 +314,21 @@ class ProgressDB:
             "WHERE status = 'done' AND vector_index IS NOT ? "
             f"ORDER BY title LIMIT {int(limit)}",
             (index_name,),
+        )
+
+    def finished_articles(self, level: int) -> list[Row]:
+        return self.db.query(
+            "SELECT * FROM articles WHERE status = 'done' AND vital_level <= ? "
+            "ORDER BY title",
+            (level,),
+        )
+
+    def reset_vectorized(self, level: int) -> None:
+        """Mark finished reels for re-upsert so their metadata is refreshed."""
+        self.db.query(
+            "UPDATE articles SET vector_index = NULL, vectorized_at = NULL "
+            "WHERE status = 'done' AND vital_level <= ?",
+            (level,),
         )
 
     def mark_vectorized(self, titles: list[str], index_name: str) -> None:
