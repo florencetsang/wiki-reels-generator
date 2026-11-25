@@ -11,6 +11,7 @@ import requests
 
 from .common import Row, Statement, cloudflare_result, utc_now_iso
 from .config import CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, D1_DATABASE_ID
+from .wikipedia import VitalTopic
 
 
 # Statements per D1 HTTP request; each request must finish within 30 seconds.
@@ -158,6 +159,8 @@ class ProgressDB:
                 "r2_reel_uploaded_at": "TEXT",
                 "vectorized_at": "TEXT",
                 "vector_index": "TEXT",
+                "vital_field": "TEXT",
+                "vital_subfield": "TEXT",
             },
             "sections": {
                 "r2_bucket": "TEXT",
@@ -186,21 +189,40 @@ class ProgressDB:
             "SELECT 1 FROM discoveries WHERE level = ?", (level,)
         ) is not None
 
-    def save_discovery(self, level: int, titles: list[str]) -> None:
+    def save_discovery(self, level: int, titles: dict[str, VitalTopic]) -> None:
         now = utc_now_iso()
         self.db.batch(
             [
                 (
-                    "INSERT OR IGNORE INTO articles (title, vital_level, updated_at) "
-                    "VALUES (?, ?, ?)",
-                    (title, level, now),
+                    "INSERT INTO articles (title, vital_level, vital_field, "
+                    "vital_subfield, updated_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (title) DO UPDATE SET "
+                    "vital_field = COALESCE(excluded.vital_field, vital_field), "
+                    "vital_subfield = COALESCE(excluded.vital_subfield, vital_subfield)",
+                    (title, level, topic.field, topic.subfield, now),
                 )
-                for title in titles
+                for title, topic in titles.items()
             ]
         )
         self.db.query(
             "INSERT OR REPLACE INTO discoveries VALUES (?, ?, ?)",
             (level, len(titles), now),
+        )
+
+    def save_labels(self, titles: dict[str, VitalTopic]) -> None:
+        """Set field labels on already-known articles without adding new ones."""
+        now = utc_now_iso()
+        self.db.batch(
+            [
+                (
+                    "UPDATE articles SET "
+                    "vital_field = COALESCE(?, vital_field), "
+                    "vital_subfield = COALESCE(?, vital_subfield), updated_at = ? "
+                    "WHERE title = ?",
+                    (topic.field, topic.subfield, now, title),
+                )
+                for title, topic in titles.items()
+            ]
         )
 
     # --- articles ---
@@ -287,11 +309,26 @@ class ProgressDB:
 
     def unvectorized_articles(self, index_name: str, limit: int) -> list[Row]:
         return self.db.query(
-            "SELECT title, pageid, resolved_title, vital_level, canonical_url, "
-            "r2_reel_key, embedding FROM articles "
+            "SELECT title, pageid, resolved_title, vital_level, vital_field, "
+            "canonical_url, r2_reel_key, embedding FROM articles "
             "WHERE status = 'done' AND vector_index IS NOT ? "
             f"ORDER BY title LIMIT {int(limit)}",
             (index_name,),
+        )
+
+    def finished_articles(self, level: int) -> list[Row]:
+        return self.db.query(
+            "SELECT * FROM articles WHERE status = 'done' AND vital_level <= ? "
+            "ORDER BY title",
+            (level,),
+        )
+
+    def reset_vectorized(self, level: int) -> None:
+        """Mark finished reels for re-upsert so their metadata is refreshed."""
+        self.db.query(
+            "UPDATE articles SET vector_index = NULL, vectorized_at = NULL "
+            "WHERE status = 'done' AND vital_level <= ?",
+            (level,),
         )
 
     def mark_vectorized(self, titles: list[str], index_name: str) -> None:

@@ -29,6 +29,8 @@ def make_reel_object(row: Row, sections: list[Row]) -> dict[str, Any]:
         "canonical_url": row["canonical_url"],
         "revision_id": row["revision_id"],
         "vital_level": row["vital_level"],
+        "vital_field": row["vital_field"],
+        "vital_subfield": row["vital_subfield"],
         "summary": row["summary"],
         "categories": json.loads(row["categories"]),
         "embedding": {
@@ -184,3 +186,37 @@ def process_article(
         reel_path.write_bytes(to_json_bytes(reel))
     db.update_article(title, status="done", error=None)
     return "done"
+
+
+def backfill_labels(
+    db: ProgressDB,
+    wiki: WikipediaClient,
+    r2: R2Store | None,
+    level: int,
+    output_dir: Path,
+) -> int:
+    """
+    Add vital_field / vital_subfield to reels that are already finished.
+
+    Only Wikipedia category listings are fetched; reel JSON is rebuilt from the
+    progress DB, so no Gemini, image or embedding work is repeated. New articles
+    found in the categories are not added. Returns the number of reels rewritten.
+    """
+    for vital_level in range(1, level + 1):
+        titles = wiki.discover_vital_titles(vital_level)
+        db.save_labels(titles)
+        logging.info("Labelled level-%d articles (%d listed)", vital_level, len(titles))
+
+    rewritten = 0
+    for row in db.finished_articles(level):
+        reel = make_reel_object(row, db.get_sections(row["title"]))
+        if r2 and row["r2_reel_key"]:
+            r2.put_json(row["r2_reel_key"], reel)
+        else:
+            reel_path = topic_dir(output_dir, row) / "reel.json"
+            if not reel_path.exists():
+                continue
+            reel_path.write_bytes(to_json_bytes(reel))
+        rewritten += 1
+    db.reset_vectorized(level)
+    return rewritten
