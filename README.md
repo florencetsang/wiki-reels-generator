@@ -17,8 +17,8 @@ Objects are written to Cloudflare R2 in this structure:
 
 ```text
 reels/<pageid>.json
-reels/<pageid>/infographics/001.png
-reels/<pageid>/infographics/002.png
+reels/<pageid>/infographics/001.webp
+reels/<pageid>/infographics/002.webp
 ...
 manifests/<run_id>.json
 ```
@@ -80,8 +80,8 @@ This still fetches Wikipedia content, generates embeddings, and—unless `--no-i
 
 ```text
 reels/<pageid>.json
-reels/<pageid>/infographics/001.png
-reels/<pageid>/infographics/002.png
+reels/<pageid>/infographics/001.webp
+reels/<pageid>/infographics/002.webp
 ...
 ```
 
@@ -172,6 +172,7 @@ ERROR
 | `--dry-run` | Fetch Wikipedia content and create embeddings, but do not upload objects to R2. Gemini calls still occur unless `--no-images` is used. |
 | `--resume` | Skip reel JSON and infographic assets that are already present in R2. |
 | `--no-images` | Skip Gemini image generation and create only metadata plus embeddings. |
+| `--backfill-labels` | Add `vital_field` / `vital_subfield` to finished reels' JSON and vector metadata without calling Gemini or re-embedding, then exit. |
 | `--titles-file PATH` | Read article titles from a newline-delimited file instead of discovering Vital Articles. |
 | `--log-level LEVEL` | Set logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 
@@ -181,48 +182,71 @@ Each reel is stored as `reels/<pageid>.json` and resembles:
 
 ```json
 {
-  "schema_version": "1.0",
-  "type": "wikipedia_reel",
-  "id": "wikipedia:12345",
+  "pageid": 12345,
   "title": "Example article",
+  "canonical_url": "https://en.wikipedia.org/wiki/Example_article",
+  "revision_id": 123456789,
+  "vital_level": 4,
+  "vital_field": "physical_sciences",
+  "vital_subfield": "Astronomy",
   "summary": "The article lead text.",
-  "category_tags": ["Example categories"],
+  "categories": ["Example categories"],
   "embedding": {
     "model": "sentence-transformers/all-MiniLM-L6-v2",
-    "dimensions": 384,
-    "normalized": true,
+    "dim": 384,
     "vector": []
   },
-  "infographics": {
-    "page_count": 2,
-    "sections": ["History", "Legacy"],
-    "assets": [
-      {
-        "page": 1,
-        "section": "History",
-        "r2_key": "reels/12345/infographics/001.png",
-        "mime_type": "image/png",
-        "status": "generated"
-      }
-    ],
-    "generator": {
-      "provider": "Google Gemini",
-      "model": "gemini-2.5-flash-image",
-      "aspect_ratio": "9:16"
+  "infographics": [
+    {
+      "page": 1,
+      "section": "History",
+      "r2_bucket": "wikiinfo",
+      "r2_key": "reels/12345/infographics/001.webp",
+      "mime_type": "image/webp"
     }
-  },
-  "source": {
-    "project": "English Wikipedia",
-    "article_url": "https://en.wikipedia.org/wiki/Example_article",
-    "pageid": 12345,
-    "revision_id": 123456789,
-    "revision_timestamp": "2026-01-01T00:00:00Z",
-    "vital_article_levels": [3],
-    "license_note": "..."
-  },
-  "generated_at": "2026-01-01T00:00:00+00:00"
+  ],
+  "updated_at": "2026-01-01T00:00:00+00:00"
 }
 ```
+
+### Vital Articles fields
+
+`vital_field` is the top-level Vital Articles field of the category the article
+was discovered in (`Category:Wikipedia level-N vital articles in <Field>`),
+stored as a stable slug: `people`, `history`, `geography`, `arts`,
+`philosophy_religion`, `everyday_life`, `society`, `biology_health`,
+`physical_sciences`, `technology`, `mathematics`. `vital_subfield` is the name of
+a deeper `... vital articles in <Name>` category when there is one. Both are
+`null` when the article is only in the root category.
+
+The field is also written to Vectorize metadata as `vital_field`. To filter on
+it, create a metadata index before upserting:
+
+```bash
+npx wrangler vectorize create-metadata-index wiki-reels --property-name=vital_field --type=string
+```
+
+#### Labelling reels that are already generated
+
+Progress databases created before these columns existed are migrated
+automatically. To add the labels to finished reels without repeating any paid
+work, run:
+
+```bash
+python infographics.py --level 4 --backfill-labels   # add --local for a local progress DB
+```
+
+This mode:
+
+- only reads Wikipedia category listings;
+- rebuilds each finished reel's JSON from the progress database and overwrites
+  `reels/<pageid>.json` in R2, leaving the infographics untouched;
+- re-upserts the stored embeddings to Vectorize with the new metadata;
+- makes no Gemini calls and does no re-embedding;
+- does not add or process newly listed articles, then exits.
+
+Plain `--rediscover` also refreshes the labels in the database, but it then
+processes any newly discovered articles, which does call Gemini.
 
 ## Section selection
 
